@@ -7,11 +7,10 @@ package cmd
 import (
 	"crypto/rsa"
 	"crypto/x509"
-	"flag"
 	// "fmt"
+	"io/ioutil"
 	"log"
 
-	//"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
@@ -20,9 +19,10 @@ import (
 
 	"github.com/google/go-tpm-tools/tpm2tools"
 	"github.com/google/go-tpm/tpm2"
+	tpm_conn "github.com/lukehinds/tpm-sigstore-sign/pkg/tpm"
 
 	"github.com/spf13/cobra"
-	// "github.com/spf13/viper"
+	"github.com/spf13/viper"
 )
 
 const ()
@@ -34,10 +34,6 @@ var (
 		"saved":     {tpm2.HandleTypeSavedSession},
 		"transient": {tpm2.HandleTypeTransient},
 	}
-
-	tpmPath = flag.String("tpm-path", "/dev/tpm0", "Path to the TPM device (character device or a Unix socket).")
-
-	// https://github.com/google/go-attestation/blob/master/attest/tpm.go#L48
 
 	defaultEKTemplate = tpm2.Public{
 		Type:    tpm2.AlgRSA,
@@ -102,20 +98,27 @@ var signCmd = &cobra.Command{
 	Short: "sign using a tpm",
 	Long: ``,
 	Run: func(cmd *cobra.Command, args []string) {
-		flag.Parse()
-		log.Println("======= Init  ========")
+
+		viper.BindPFlags(cmd.Flags())
+		tpmpath := viper.GetString("tpm-path")
+
+		// Open the file to sign
+		signfile := viper.GetString("file")
+		if signfile == "" {
+			log.Fatal("No file to sign, please pass in a file nanme with --file")
+		}
+
+		// Set PCR 23
 		pcr := 23
 
-		rwc, err := tpm2.OpenTPM(*tpmPath)
+		// Open the TPM device (returns a io.ReadWriteCloser)
+		rwc, err := tpm_conn.TPMConn(tpmpath)
 		if err != nil {
-			log.Fatal("can't open TPM: {} {} ", tpmPath, err)
+			log.Fatal("can't open TPM: {} {} ", tpmpath, err)
 		}
-		defer func() {
-			if err := rwc.Close(); err != nil {
-				log.Fatal("\ncan't close TPM: {} {}", tpmPath, err)
-			}
-		}()
-
+		defer rwc.Close()
+        
+		// Flush all existing handles
 		totalHandles := 0
 		for _, handleType := range handleNames["all"] {
 			handles, err := tpm2tools.Handles(rwc, handleType)
@@ -154,6 +157,7 @@ var signCmd = &cobra.Command{
 			log.Fatalf("Error creating EK: %v", err)
 		}
 		defer tpm2.FlushContext(rwc, ekh)
+
 		log.Printf("======= CreateKeyUsingAuth ========")
 
 		sessCreateHandle, _, err := tpm2.StartAuthSession(
@@ -170,6 +174,8 @@ var signCmd = &cobra.Command{
 		}
 		defer tpm2.FlushContext(rwc, sessCreateHandle)
 
+		// Couples the authorization of an object to that of an existing object without requiring exposing the existing secret until time of object use.
+		// https://github.com/tpm2-software/tpm2-tools/blob/master/man/tpm2_policysecret.1.md
 		if _, err := tpm2.PolicySecret(rwc, tpm2.HandleEndorsement, tpm2.AuthCommand{Session: tpm2.HandlePasswordSession, Attributes: tpm2.AttrContinueSession}, sessCreateHandle, nil, nil, nil, 0); err != nil {
 			log.Fatalf("Unable to create PolicySecret: %v", err)
 		}
@@ -178,12 +184,12 @@ var signCmd = &cobra.Command{
 
 		authCommandCreateAuth := tpm2.AuthCommand{Session: sessCreateHandle, Attributes: tpm2.AttrContinueSession}
 
+		// CreateKeyUsingAuth creates a new key pair under the owner handle using the provided AuthCommand. 
+		// Returns private key "akPriv" and public key blobs "akPub" as well as the creation data, a hash of said data, and the creation ticket.
 		akPriv, akPub, _, _, _, err := tpm2.CreateKeyUsingAuth(rwc, ekh, pcrSelection23, authCommandCreateAuth, emptyPassword, defaultKeyParams)
 		if err != nil {
 			log.Fatalf("Create AKKey failed: %s", err)
 		}
-		log.Printf("akPub: %v,", hex.EncodeToString(akPub))
-		log.Printf("akPriv: %v,", hex.EncodeToString(akPriv))
 
 		tPub, err := tpm2.DecodePublic(akPub)
 		if err != nil {
@@ -266,8 +272,13 @@ var signCmd = &cobra.Command{
 		}
 		authCommandCreateAuth = tpm2.AuthCommand{Session: sessCreateHandle, Attributes: tpm2.AttrContinueSession}
 
-		aKdataToSign := []byte("secret")
-		aKdigest, aKvalidation, err := tpm2.Hash(rwc, tpm2.AlgSHA256, aKdataToSign, tpm2.HandleOwner)
+		// aKdataToSign := []byte("secret")
+		fileToSign, err := ioutil.ReadFile(signfile) // just pass the file name
+		if err != nil {
+			log.Print(err)
+		}
+
+		aKdigest, aKvalidation, err := tpm2.Hash(rwc, tpm2.AlgSHA256, fileToSign, tpm2.HandleOwner)
 		if err != nil {
 			log.Fatalf("Hash failed unexpectedly: %v", err)
 		}
@@ -295,121 +306,26 @@ var signCmd = &cobra.Command{
 		akRsaPub := *akRsa.(*rsa.PublicKey)
 
 		akhsh := crypto.SHA256.New()
-		akhsh.Write(aKdataToSign)
+		akhsh.Write(fileToSign)
 
 		if err := rsa.VerifyPKCS1v15(&akRsaPub, crypto.SHA256, akhsh.Sum(nil), aKsig.RSA.Signature); err != nil {
 			log.Fatalf("VerifyPKCS1v15 failed: %v", err)
 		}
+
 		log.Printf("AK Verified Signature\n")
-
-		// >>>>>>>>>>>>>>>>> using unrestricted Key
-
-		ukPriv, ukPub, _, _, _, err := tpm2.CreateKeyUsingAuth(rwc, ekh, pcrSelection23, authCommandCreateAuth, emptyPassword, unrestrictedKeyParams)
-
-		if err != nil {
-			log.Fatalf("UnrestrictedCreateKey failed: %s", err)
-		}
-		log.Printf("Unrestricted ukPub: %v,", hex.EncodeToString(ukPub))
-		log.Printf("Unrestricted ukPriv: %v,", hex.EncodeToString(ukPriv))
-
-		tpm2.FlushContext(rwc, sessCreateHandle)
-
-		// Load the unrestricted key
-		sessLoadHandle, _, err = tpm2.StartAuthSession(
-			rwc,
-			tpm2.HandleNull,
-			tpm2.HandleNull,
-			make([]byte, 16),
-			nil,
-			tpm2.SessionPolicy,
-			tpm2.AlgNull,
-			tpm2.AlgSHA256)
-		if err != nil {
-			log.Fatalf("Unable to create StartAuthSession : %v", err)
-		}
-		defer tpm2.FlushContext(rwc, sessLoadHandle)
-
-		if _, err := tpm2.PolicySecret(rwc, tpm2.HandleEndorsement, tpm2.AuthCommand{Session: tpm2.HandlePasswordSession, Attributes: tpm2.AttrContinueSession}, sessLoadHandle, nil, nil, nil, 0); err != nil {
-			log.Fatalf("Unable to create PolicySecret: %v", err)
-		}
-		authCommandLoad = tpm2.AuthCommand{Session: sessLoadHandle, Attributes: tpm2.AttrContinueSession}
-
-		ukeyHandle, ukeyName, err := tpm2.LoadUsingAuth(rwc, ekh, authCommandLoad, ukPub, ukPriv)
-
-		if err != nil {
-			log.Fatalf("Load failed: %s", err)
-		}
-		defer tpm2.FlushContext(rwc, ukeyHandle)
-		log.Printf("ukeyName: %v,", hex.EncodeToString(ukeyName))
-
-		// Certify the Unrestricted key using the AK
-		attestation, csig, err := tpm2.Certify(rwc, emptyPassword, emptyPassword, ukeyHandle, aKkeyHandle, nil)
-		if err != nil {
-			log.Fatalf("Load failed: %s", err)
-		}
-		log.Printf("Certify Attestation: %v,", hex.EncodeToString(attestation))
-		log.Printf("Certify Signature: %v,", hex.EncodeToString(csig))
-		tpm2.FlushContext(rwc, sessLoadHandle)
-
-		// Now Sign some arbitrary data with the unrestricted Key
-		dataToSign := []byte("secret")
-
-		digest, ukValidation, err := tpm2.Hash(rwc, tpm2.AlgSHA256, dataToSign, tpm2.HandleNull)
-		if err != nil {
-			log.Fatalf("Error Generating Hash: %v", err)
-		}
-		log.Printf("Unrestricted Key digest:  %s", base64.RawStdEncoding.EncodeToString([]byte(digest)))
-
-		sig, err := tpm2.Sign(rwc, ukeyHandle, emptyPassword, digest[:], ukValidation, &tpm2.SigScheme{
-			Alg:  tpm2.AlgRSASSA,
-			Hash: tpm2.AlgSHA256,
-		})
-		if err != nil {
-			log.Fatalf("Error Signing: %v", err)
-		}
-		log.Printf("Signature data:  %s", base64.RawStdEncoding.EncodeToString([]byte(sig.RSA.Signature)))
-
-		// Verify the Certification value:
-		log.Printf("     Read and Decode (attestion)")
-		att, err := tpm2.DecodeAttestationData(attestation)
-		if err != nil {
-			log.Fatalf("DecodeAttestationData(%v) failed: %v", attestation, err)
-		}
-		log.Printf("     Attestation att.AttestedCertifyInfo.QualifiedName: %s", hex.EncodeToString(att.AttestedCertifyInfo.QualifiedName.Digest.Value))
-
-		sigL := tpm2.SignatureRSA{
-			HashAlg:   tpm2.AlgSHA256,
-			Signature: csig,
+		// save akPubPEM to file
+		if err := ioutil.WriteFile("public-key.pub", akPubPEM, 0644); err != nil {
+			log.Fatalf("Unable to write akPubPEM to file %v", err)
 		}
 
-		// Verify signature of Attestation by using the PEM Public key for AK
-		log.Printf("     Decoding PublicKey for AK ========")
-
-		block, _ := pem.Decode(akPubPEM)
-		if block == nil {
-			log.Fatalf("Unable to decode akPubPEM %v", err)
+		// write aKsig to file
+		if err := ioutil.WriteFile("signature.sig", aKsig.RSA.Signature, 0644); err != nil {
+			log.Fatalf("Unable to write aKsig to file %v", err)
 		}
 
-		r, err := x509.ParsePKIXPublicKey(block.Bytes)
-		if err != nil {
-			log.Fatalf("Unable to create rsa Key from PEM %v", err)
-		}
-		rsaPub := *r.(*rsa.PublicKey)
+		// to verify signature, use openssl
 
-		// p, err := tpm2.DecodePublic(akPub)
-		// if err != nil {
-		// 	log.Fatalf("DecodePublic failed: %v", err)
-		// }
-		// rsaPub := rsa.PublicKey{E: int(p.RSAParameters.Exponent()), N: p.RSAParameters.Modulus()}
-		// rsaPub = *ap.(*rsa.PublicKey)
-
-		hsh := crypto.SHA256.New()
-		hsh.Write(attestation)
-
-		if err := rsa.VerifyPKCS1v15(&rsaPub, crypto.SHA256, hsh.Sum(nil), sigL.Signature); err != nil {
-			log.Fatalf("VerifyPKCS1v15 failed: %v", err)
-		}
-		log.Printf("Attestation Verified")
+		// openssl dgst -verify public-key.pub -keyform PEM -sha256 -signature signature.sig -binary Vagrantfile
 
 	},
 }
