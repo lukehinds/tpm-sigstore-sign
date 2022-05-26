@@ -7,18 +7,22 @@ package cmd
 import (
 	"crypto/rsa"
 	"crypto/x509"
-	// "fmt"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
-
+	"os"
+	
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 
 	"crypto"
+	"reflect"
 
 	"github.com/google/go-tpm-tools/tpm2tools"
 	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpmutil"
 	tpm_conn "github.com/lukehinds/tpm-sigstore-sign/pkg/tpm"
 
 	"github.com/spf13/cobra"
@@ -91,6 +95,94 @@ var (
 	}
 )
 
+func readEKCert(path string, certIdx, tmplIdx uint32) ([]byte, error) {
+	rwc, err := tpm2.OpenTPM(path)
+	if err != nil {
+		return nil, fmt.Errorf("can't open TPM at %q: %v", path, err)
+	}
+	defer rwc.Close()
+	ekCert, err := tpm2.NVRead(rwc, tpmutil.Handle(certIdx))
+	if err != nil {
+		return nil, fmt.Errorf("reading EK cert: %v", err)
+	}
+	// Sanity-check that this is a valid certificate.
+	cert, err := x509.ParseCertificate(ekCert)
+	if err != nil {
+		return nil, fmt.Errorf("parsing EK cert: %v", err)
+	}
+
+	// Initialize EK and compare public key to ekCert.PublicKey.
+	var ekh tpmutil.Handle
+	var ekPub crypto.PublicKey
+	if tmplIdx != 0 {
+		ekTemplate, err := tpm2.NVRead(rwc, tpmutil.Handle(tmplIdx))
+		if err != nil {
+			return nil, fmt.Errorf("reading EK template: %v", err)
+		}
+		ekh, ekPub, err = tpm2.CreatePrimaryRawTemplate(rwc, tpm2.HandleEndorsement, tpm2.PCRSelection{}, "", "", ekTemplate)
+		if err != nil {
+			return nil, fmt.Errorf("creating EK: %v", err)
+		}
+	} else {
+		ekh, ekPub, err = tpm2.CreatePrimary(rwc, tpm2.HandleEndorsement, tpm2.PCRSelection{}, "", "", defaultEKTemplate)
+		if err != nil {
+			return nil, fmt.Errorf("creating EK: %v", err)
+		}
+	}
+	defer tpm2.FlushContext(rwc, ekh)
+	
+	// convert cert to PEM format
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: ekCert,
+	})
+
+	// write to file
+	certPEMFile, err := os.Create("certPEMFile.pem")
+	if err != nil {
+		return nil, fmt.Errorf("creating ekcert.pem: %v", err)
+	}
+	defer certPEMFile.Close()
+	certPEMFile.Write(certPEM)
+	
+
+	// convert public key to PEM format
+	pubPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: x509.MarshalPKCS1PublicKey(ekPub.(*rsa.PublicKey)),
+	})
+
+	// write to file
+	pubPemFile, err := os.Create("pubPEM.pem")
+	if err != nil {
+		return nil, fmt.Errorf("creating ekcert.pem: %v", err)
+	}
+	defer pubPemFile.Close()
+	pubPemFile.Write(pubPEM)
+
+	// convert cert.PublicKey to PEM format
+	pubCertPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: x509.MarshalPKCS1PublicKey(cert.PublicKey.(*rsa.PublicKey)),
+	})
+
+	pubCertPEMFile, err := os.Create("pubCertPEM.pem")
+	if err != nil {
+		return nil, fmt.Errorf("creating ekcert.pem: %v", err)
+	}
+	defer pubCertPEMFile.Close()
+	pubCertPEMFile.Write(pubCertPEM)
+
+	// fmt.Println("EK public key:", string(pubPEM))
+	// fmt.Println("EK cert public key:", string(pubCertPEM))
+	// fmt.Println("EK cert:", string(certPEM))
+
+	if !reflect.DeepEqual(ekPub, cert.PublicKey) {
+		return nil, errors.New("public key in EK certificate differs from public key created via EK template")
+	}
+
+	return ekCert, nil
+}
 
 // signCmd represents the sign command
 var signCmd = &cobra.Command{
@@ -99,8 +191,16 @@ var signCmd = &cobra.Command{
 	Long: ``,
 	Run: func(cmd *cobra.Command, args []string) {
 
+
 		viper.BindPFlags(cmd.Flags())
 		tpmpath := viper.GetString("tpm-path")
+
+		cert, err := readEKCert(*&tpmpath, uint32(0x01C00002), uint32(0))
+		if err != nil {
+			log.Println("Certs don't match, but might be a vtpm thing:", err)
+		}
+
+		log.Println("EK certificate:", cert)
 
 		// Open the file to sign
 		signfile := viper.GetString("file")
