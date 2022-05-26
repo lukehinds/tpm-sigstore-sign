@@ -32,6 +32,7 @@ import (
 const ()
 
 var (
+	encryptionCertNVIndex = 0x01c00002
 	handleNames = map[string][]tpm2.HandleType{
 		"all":       {tpm2.HandleTypeLoadedSession, tpm2.HandleTypeSavedSession, tpm2.HandleTypeTransient},
 		"loaded":    {tpm2.HandleTypeLoadedSession},
@@ -184,6 +185,53 @@ func readEKCert(path string, certIdx, tmplIdx uint32) ([]byte, error) {
 	return ekCert, nil
 }
 
+func getGCPEKCert(tpmpath string) (string, error) {
+	log.Println("Getting GCP EK certificate")
+	rwc, err := tpm_conn.TPMConn(tpmpath)
+		if err != nil {
+			log.Fatal("can't open TPM: {} {} ", tpmpath, err)
+		}
+	defer rwc.Close()
+
+	var ekcertBytes []byte
+	ekk, err := tpm2tools.EndorsementKeyRSA(rwc)
+	if err != nil {
+		log.Fatal("can't get EK: {}", err)
+	}
+	defer ekk.Close()
+
+	epubKey := ekk.PublicKey().(*rsa.PublicKey)
+	ekBytes, err := x509.MarshalPKIXPublicKey(epubKey)
+	if err != nil {
+		log.Fatal("can't marshal EK public key: {}", err)
+	}
+
+	ekPubPEM := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "PUBLIC KEY",
+			Bytes: ekBytes,
+		},
+	)
+	log.Println("EK public key:", string(ekPubPEM))
+	tpmEkPub, _, _, err := tpm2.ReadPublic(rwc, ekk.Handle())
+	if err != nil {
+		log.Fatal("can't read EK public key: {}", err)
+	}
+	_, err = tpmEkPub.Encode()
+
+	ekcertBytes, err = tpm2.NVReadEx(rwc, 0x01c00002, tpm2.HandleOwner, "", 0)
+	if err != nil {
+		log.Fatal("can't read NV: {}", err)
+	}
+
+	encCert, err := x509.ParseCertificate(ekcertBytes)
+	if err != nil {
+		log.Fatal("can't parse EK cert: {}", err)
+	}
+
+	log.Println("EK cert public key:", encCert.Issuer.CommonName)
+	return encCert.Issuer.CommonName, nil
+}
 // signCmd represents the sign command
 var signCmd = &cobra.Command{
 	Use:   "sign",
@@ -202,6 +250,11 @@ var signCmd = &cobra.Command{
 
 		log.Println("EK certificate:", cert)
 
+		gcp_cert, err := getGCPEKCert(*&tpmpath)
+		if err != nil {
+			log.Println("something went wrong:", err)
+		}
+		log.Println("GCP EK certificate:", gcp_cert)
 		// Open the file to sign
 		signfile := viper.GetString("file")
 		if signfile == "" {
